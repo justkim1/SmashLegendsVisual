@@ -2,181 +2,122 @@
 #define ESP_YOLO_DETECTOR_H
 
 #include <atomic>
-#include <memory>
-#include <string>
+#include <mutex>
+#include <vector>
 #include <android/asset_manager.h>
 #include <android/hardware_buffer.h>
-#include <ncnn/net.h>
-#include <ncnn/gpu.h>
+
 #include "bounding_box.h"
 #include "../settings.h"
 #include "../utils/logger.h"
 #include "../utils/memory_pool.h"
 
-/**
- * @file yolo_detector.h
- * @brief NCNN-based YOLOv26n inference engine with Vulkan acceleration
- * 
- * Handles model loading, preprocessing, inference, and post-processing.
- * Optimized for Adreno 660 GPU with FP16 storage.
- */
-
 namespace ESP {
 
-/**
- * @struct DetectionResult
- * @brief Container for detection results (pre-allocated, no heap allocation)
- */
 struct DetectionResult {
-    DetectionArray boxes;  // Use FixedArray for zero-allocation, auto-sized list
+    DetectionArray boxes;
     float inferenceTimeMs;
-    
+
     DetectionResult() : inferenceTimeMs(0.0f) {}
-    
+
     void clear() {
         boxes.clear();
         inferenceTimeMs = 0.0f;
     }
 };
 
-/**
- * @class YoloDetector
- * @brief YOLOv26n detector with NCNN Vulkan backend
- */
 class YoloDetector {
 public:
     YoloDetector();
     ~YoloDetector();
-    
-    // Non-copyable
+
     YoloDetector(const YoloDetector&) = delete;
     YoloDetector& operator=(const YoloDetector&) = delete;
-    
-    /**
-     * @brief Initialize detector with model from assets
-     * @param assetManager Android AssetManager for loading model files
-     * @param screenWidth Full screen width for coordinate mapping
-     * @param screenHeight Full screen height for coordinate mapping
-     * @return true if initialization successful
-     */
+
     bool initialize(AAssetManager* assetManager,
                     int screenWidth,
                     int screenHeight,
                     const char* modelParamPath = nullptr,
                     const char* modelBinPath = nullptr);
-    
-    /**
-     * @brief Shutdown detector and release resources
-     */
-    void shutdown();
-    
-    /**
-     * @brief Run detection on hardware buffer
-     * @param buffer AHardwareBuffer from screen capture
-     * @param result Output detection result (pre-allocated)
-     * @return true if detection successful
-     */
-    bool detect(AHardwareBuffer* buffer, DetectionResult& result);
-    bool detect(AHardwareBuffer* buffer, DetectionResult& result, int dynamicCropSize);
 
-    /**
-     * @brief Update screen size for coordinate mapping
-     * @param screenWidth Current screen width in pixels
-     * @param screenHeight Current screen height in pixels
-     */
+    void shutdown();
+
+    bool detect(AHardwareBuffer* buffer, DetectionResult& result);
+    bool detect(AHardwareBuffer* buffer,
+                DetectionResult& result,
+                int dynamicCropSize);
+
     void setScreenSize(int screenWidth, int screenHeight) {
         screenWidth_.store(screenWidth, std::memory_order_relaxed);
         screenHeight_.store(screenHeight, std::memory_order_relaxed);
     }
-    
-    /**
-     * @brief Set confidence threshold
-     * @param threshold Confidence threshold (0.3 - 0.9)
-     */
+
     void setConfidenceThreshold(float threshold) {
         confidenceThreshold_.store(threshold, std::memory_order_relaxed);
     }
-    
-    /**
-     * @brief Get current confidence threshold
-     * @return Current threshold
-     */
+
     float getConfidenceThreshold() const {
         return confidenceThreshold_.load(std::memory_order_relaxed);
     }
-    
-    /**
-     * @brief Check if detector is initialized
-     * @return true if ready for inference
-     */
-    bool isInitialized() const { return initialized_; }
 
-    /**
-     * @brief Get the latest detection result thread-safely
-     * @return Copy of the latest result
-     */
+    bool isInitialized() const {
+        return initialized_;
+    }
+
     DetectionResult getResult() const;
 
 private:
-    /**
-     * @brief Preprocess image: center crop and resize
-     * @param buffer Input hardware buffer
-     * @param inputMat Output NCNN mat ready for inference
-     * @return true if preprocessing successful
-     */
-    bool preprocess(AHardwareBuffer* buffer, ncnn::Mat& inputMat, int cropSize = Config::CROP_SIZE);
-    
-    /**
-     * @brief Run NCNN inference
-     * @param input Preprocessed input mat
-     * @param output Raw output from network
-     * @return true if inference successful
-     */
-    bool runInference(const ncnn::Mat& input, ncnn::Mat& output);
-    
-    /**
-     * @brief Post-process: decode boxes, apply NMS, map coordinates
-     * @param output Raw network output
-     * @param result Output detection result
-     */
-    void postprocess(const ncnn::Mat& output, DetectionResult& result, int cropSize = Config::CROP_SIZE);
-    
-    /**
-     * @brief Apply Non-Maximum Suppression
-     * @param boxes Input boxes
-     * @param result Output filtered boxes
-     */
+    // 실제 캡처 버퍼 크기를 읽는다.
+    bool getBufferInfo(AHardwareBuffer* buffer,
+                       int& width,
+                       int& height,
+                       int& stride);
+
+    // 픽셀 기반 후보 탐지.
+    void analyzeFrame(const uint8_t* pixels,
+                      int width,
+                      int height,
+                      int stride,
+                      int cropSize,
+                      DetectionResult& result);
+
+    // 후보 영역을 주변 픽셀과 비교해 점수화.
+    float scoreCandidate(const uint8_t* pixels,
+                         int width,
+                         int height,
+                         int stride,
+                         int x,
+                         int y,
+                         int w,
+                         int h) const;
+
+    // 중복 후보 제거.
     void applyNMS(DetectionArray& boxes);
-    
-    ncnn::Net net_;
-    ncnn::VulkanDevice* vulkanDevice_;
-    bool initialized_;
-    
-    // Screen dimensions for coordinate mapping
+
+    // 좌표를 실제 화면 좌표로 변환.
+    BoundingBox mapToScreen(float x,
+                            float y,
+                            float w,
+                            float h,
+                            int captureWidth,
+                            int captureHeight) const;
+
     std::atomic<int> screenWidth_;
     std::atomic<int> screenHeight_;
-    
-    // Configuration
     std::atomic<float> confidenceThreshold_;
-    
-    // Runtime state
-    int currentCropX_ = 0;
-    int currentCropY_ = 0;
-    int currentCaptureWidth_ = 0;
-    int currentCaptureHeight_ = 0;
 
-    // Cached blob names to avoid repeated lookup warnings
-    std::string inputBlobName_;
-    std::string outputBlobName_;
-    bool useInputIndex_ = false;
-    bool useOutputIndex_ = false;
-    
-    // Result storage
+    bool initialized_;
+
+    int currentCropX_;
+    int currentCropY_;
+    int currentCaptureWidth_;
+    int currentCaptureHeight_;
+
     mutable std::mutex resultMutex_;
     DetectionResult latestResult_;
-    
-    // Pre-allocated buffers (avoid heap allocation in hot path)
-    ncnn::Mat inputMat_;
+
+    // 프레임 간 간단한 안정화용 상태.
+    std::vector<BoundingBox> previousBoxes_;
 };
 
 } // namespace ESP

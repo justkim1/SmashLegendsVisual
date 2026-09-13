@@ -1,123 +1,79 @@
 #include "yolo_detector.h"
-#include <chrono>
+
 #include <algorithm>
-#include <array>
-#include <android/hardware_buffer_jni.h>
+#include <chrono>
+#include <cmath>
+#include <cstdint>
+#include <cstring>
 
 namespace ESP {
 
+namespace {
+
+static inline uint8_t clampByte(int v) {
+    return static_cast<uint8_t>(std::max(0, std::min(255, v)));
+}
+
+static inline float pixelRedScore(uint8_t r, uint8_t g, uint8_t b) {
+    const float rf = static_cast<float>(r);
+    const float gf = static_cast<float>(g);
+    const float bf = static_cast<float>(b);
+
+    if (rf < 100.0f) return 0.0f;
+
+    const float dominance =
+        (rf - std::max(gf, bf)) / 255.0f;
+
+    return std::max(0.0f, std::min(1.0f, dominance * 2.5f));
+}
+
+static inline bool validBox(float x, float y, float w, float h) {
+    return w >= 4.0f &&
+           h >= 4.0f &&
+           w <= 600.0f &&
+           h <= 600.0f &&
+           x >= -w &&
+           y >= -h;
+}
+
+} // namespace
+
 YoloDetector::YoloDetector()
-    : vulkanDevice_(nullptr)
+    : screenWidth_(2560)
+    , screenHeight_(1600)
+    , confidenceThreshold_(Config::DEFAULT_CONFIDENCE_THRESHOLD)
     , initialized_(false)
-    , screenWidth_(1080)
-    , screenHeight_(2400)
-    , confidenceThreshold_(Config::DEFAULT_CONFIDENCE_THRESHOLD) {
-    LOGD("YoloDetector created");
+    , currentCropX_(0)
+    , currentCropY_(0)
+    , currentCaptureWidth_(0)
+    , currentCaptureHeight_(0) {
+    LOGD("Model-free visual detector created");
 }
 
 YoloDetector::~YoloDetector() {
     shutdown();
 }
 
-bool YoloDetector::initialize(AAssetManager* assetManager,
+bool YoloDetector::initialize(AAssetManager* /*assetManager*/,
                               int screenWidth,
                               int screenHeight,
-                              const char* modelParamPath,
-                              const char* modelBinPath) {
-    if (initialized_) {
-        LOGW("YoloDetector already initialized");
-        return true;
-    }
-    
-    if (!assetManager) {
-        LOGE("AssetManager is null");
-        return false;
-    }
-    
-    screenWidth_.store(screenWidth, std::memory_order_relaxed);
-    screenHeight_.store(screenHeight, std::memory_order_relaxed);
-    LOGI("Initializing YoloDetector for screen %dx%d", screenWidth, screenHeight);
-    
-    // Initialize Vulkan if available
-    int gpuCount = ncnn::get_gpu_count();
-    LOGI("NCNN GPU count: %d", gpuCount);
-    
-    if (gpuCount > 0 && Config::NCNN_USE_VULKAN_COMPUTE) {
-        vulkanDevice_ = ncnn::get_gpu_device(0);
-        if (vulkanDevice_) {
-            net_.set_vulkan_device(vulkanDevice_);
-            LOGI("Vulkan device set: %s", vulkanDevice_->info.device_name());
-        } else {
-            LOGW("Failed to get Vulkan device, falling back to CPU");
-        }
-    } else {
-        LOGI("Vulkan not available or disabled, using CPU");
-    }
-    
-    // Configure NCNN options for Adreno 660
-    net_.opt.use_vulkan_compute = (vulkanDevice_ != nullptr);
-    net_.opt.use_fp16_packed = Config::NCNN_USE_FP16_PACKED;
-    net_.opt.use_fp16_storage = Config::NCNN_USE_FP16_STORAGE;
-    net_.opt.use_fp16_arithmetic = Config::NCNN_USE_FP16_ARITHMETIC;
-    net_.opt.use_packing_layout = Config::NCNN_USE_PACKING_LAYOUT;
-    net_.opt.use_sgemm_convolution = true;  // Optimized matrix multiplication
-    net_.opt.use_winograd_convolution = true;  // Fast convolution algorithm
-    net_.opt.lightmode = Config::NCNN_LIGHT_MODE;
-    net_.opt.num_threads = Config::NCNN_NUM_THREADS;
-    
-    LOGI("NCNN options: vulkan=%d, fp16_storage=%d, fp16_arith=%d, threads=%d",
-         net_.opt.use_vulkan_compute, net_.opt.use_fp16_storage,
-         net_.opt.use_fp16_arithmetic, net_.opt.num_threads);
-    
-    int ret = -1;
-    if (modelParamPath && modelBinPath && modelParamPath[0] != '\0' && modelBinPath[0] != '\0') {
-        LOGI("Trying local model files: %s / %s", modelParamPath, modelBinPath);
-        ret = net_.load_param(modelParamPath);
-        if (ret == 0) {
-            ret = net_.load_model(modelBinPath);
-        }
+                              const char* /*modelParamPath*/,
+                              const char* /*modelBinPath*/) {
+    screenWidth_.store(screenWidth > 0 ? screenWidth : 2560,
+                       std::memory_order_relaxed);
 
-        if (ret == 0) {
-            LOGI("Loaded model from local storage");
-        } else {
-            LOGW("Local model load failed (error %d), falling back to assets", ret);
-        }
-    }
+    screenHeight_.store(screenHeight > 0 ? screenHeight : 1600,
+                        std::memory_order_relaxed);
 
-    if (ret != 0) {
-        ret = net_.load_param(assetManager, Config::MODEL_PARAM_FILE);
-        if (ret != 0) {
-            LOGE("Failed to load model param: %s (error %d)", Config::MODEL_PARAM_FILE, ret);
-            return false;
-        }
-        LOGI("Loaded model param: %s", Config::MODEL_PARAM_FILE);
+    previousBoxes_.clear();
+    latestResult_.clear();
 
-        ret = net_.load_model(assetManager, Config::MODEL_BIN_FILE);
-        if (ret != 0) {
-            LOGE("Failed to load model bin: %s (error %d)", Config::MODEL_BIN_FILE, ret);
-            return false;
-        }
-        LOGI("Loaded model bin: %s", Config::MODEL_BIN_FILE);
-    }
-
-    // Cache input/output blob names when available to avoid repeated lookup warnings
-#if NCNN_STRING
-    const auto& inputNames = net_.input_names();
-    if (!inputNames.empty() && inputNames[0]) {
-        inputBlobName_ = inputNames[0];
-    }
-
-    const auto& outputNames = net_.output_names();
-    if (!outputNames.empty() && outputNames[0]) {
-        outputBlobName_ = outputNames[0];
-    }
-#endif
-    
-    // Pre-allocate input mat
-    inputMat_.create(Config::MODEL_INPUT_SIZE, Config::MODEL_INPUT_SIZE, 3);
-    
     initialized_ = true;
-    LOGI("YoloDetector initialized successfully");
+
+    LOGD("Model-free detector initialized: screen=%dx%d",
+         screenWidth_.load(),
+         screenHeight_.load());
+
     return true;
 }
 
@@ -125,413 +81,457 @@ void YoloDetector::shutdown() {
     if (!initialized_) {
         return;
     }
-    
-    LOGI("Shutting down YoloDetector");
-    net_.clear();
-    vulkanDevice_ = nullptr;
+
+    std::lock_guard<std::mutex> lock(resultMutex_);
+
+    previousBoxes_.clear();
+    latestResult_.clear();
+
     initialized_ = false;
+
+    LOGD("Model-free detector shutdown");
 }
 
-bool YoloDetector::detect(AHardwareBuffer* buffer, DetectionResult& result) {
-    if (!initialized_) {
-        LOGE("Detector not initialized");
-        return false;
-    }
-    
+bool YoloDetector::getBufferInfo(AHardwareBuffer* buffer,
+                                 int& width,
+                                 int& height,
+                                 int& stride) {
     if (!buffer) {
-        LOGE("Hardware buffer is null");
         return false;
     }
-    
-    result.clear();
-    
-    auto startTime = std::chrono::high_resolution_clock::now();
-    
-    // Preprocess: extract pixels, center crop, resize into persistent buffer
-    // ncnn::Mat inputMat; <- REMOVED, using member inputMat_
-    if (!preprocess(buffer, inputMat_, Config::CROP_SIZE)) {
-        LOGE("Preprocessing failed");
-        return false;
-    }
-    
-    // Run inference
-    ncnn::Mat output;
-    if (!runInference(inputMat_, output)) {
-        LOGE("Inference failed");
-        return false;
-    }
-    
-    // Post-process: decode boxes, NMS, coordinate mapping
-    postprocess(output, result, Config::CROP_SIZE);
-    
-    auto endTime = std::chrono::high_resolution_clock::now();
-    result.inferenceTimeMs = std::chrono::duration<float, std::milli>(endTime - startTime).count();
-    
-    // Store result thread-safely
-    {
-        std::scoped_lock lock(resultMutex_);
-        latestResult_ = result;
-    }
-    
-    LOGP("Detection: %d boxes in %.2f ms", result.boxes.size(), result.inferenceTimeMs);
-    
-    return true;
-}
 
-bool YoloDetector::detect(AHardwareBuffer* buffer, DetectionResult& result, int dynamicCropSize) {
-    if (!initialized_) {
-        LOGE("Detector not initialized");
-        return false;
-    }
-    
-    if (!buffer) {
-        LOGE("Hardware buffer is null");
-        return false;
-    }
-    
-    result.clear();
-    
-    auto startTime = std::chrono::high_resolution_clock::now();
-    
-    // Preprocess: extract pixels, center crop, resize into persistent buffer
-    if (!preprocess(buffer, inputMat_, dynamicCropSize)) {
-        LOGE("Preprocessing failed");
-        return false;
-    }
-    
-    // Run inference
-    ncnn::Mat output;
-    if (!runInference(inputMat_, output)) {
-        LOGE("Inference failed");
-        return false;
-    }
-    
-    // Post-process: decode boxes, NMS, coordinate mapping
-    postprocess(output, result, dynamicCropSize);
-    
-    auto endTime = std::chrono::high_resolution_clock::now();
-    result.inferenceTimeMs = std::chrono::duration<float, std::milli>(endTime - startTime).count();
-    
-    // Store result thread-safely
-    {
-        std::scoped_lock lock(resultMutex_);
-        latestResult_ = result;
-    }
-    
-    LOGP("Detection: %d boxes in %.2f ms", result.boxes.size(), result.inferenceTimeMs);
-    
-    return true;
-}
-
-DetectionResult YoloDetector::getResult() const {
-    std::scoped_lock lock(resultMutex_);
-    return latestResult_;
-}
-
-bool YoloDetector::preprocess(AHardwareBuffer* buffer, ncnn::Mat& inputMat, int cropSize) {
-    // Get hardware buffer description
-    AHardwareBuffer_Desc desc;
+    AHardwareBuffer_Desc desc{};
     AHardwareBuffer_describe(buffer, &desc);
-    
-    if (desc.format != AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM) {
-        LOGE("Unsupported buffer format: %d", desc.format);
-        return false;
-    }
-    
-    // Lock buffer for CPU read
-    void* pixels = nullptr;
-    int result = AHardwareBuffer_lock(buffer, AHARDWAREBUFFER_USAGE_CPU_READ_OFTEN, 
-                                       -1, nullptr, &pixels);
-    if (result != 0 || !pixels) {
-        LOGE("Failed to lock hardware buffer: %d", result);
-        return false;
-    }
-    
-    const uint8_t* srcPixels = static_cast<const uint8_t*>(pixels);
-    int srcWidth = static_cast<int>(desc.width);
-    int srcHeight = static_cast<int>(desc.height);
-    int srcStride = static_cast<int>(desc.stride) * 4;  // RGBA = 4 bytes per pixel
 
-    currentCaptureWidth_ = srcWidth;
-    currentCaptureHeight_ = srcHeight;
-    
-    // Clamp crop size
-    int actualCropSize = std::min(cropSize, std::min(srcWidth, srcHeight));
-    actualCropSize = std::max(32, actualCropSize);
+    width = static_cast<int>(desc.width);
+    height = static_cast<int>(desc.height);
+    stride = static_cast<int>(desc.stride);
 
-    // Center crop coordinates
-    int cropX = (srcWidth - actualCropSize) / 2;
-    int cropY = (srcHeight - actualCropSize) / 2;
-    currentCropX_ = std::max(0, std::min(cropX, srcWidth - actualCropSize));
-    currentCropY_ = std::max(0, std::min(cropY, srcHeight - actualCropSize));
-    
-    // OPTIMIZED: Direct resize from RGBA buffer to model input (skip intermediate crop)
-    const uint8_t* srcStart = srcPixels + currentCropY_ * srcStride + currentCropX_ * 4;
-    
-    // Use NCNN's optimized from_pixels_resize (handles RGBA->RGB + resize in one pass)
-    inputMat = ncnn::Mat::from_pixels_resize(
-        srcStart,
-        ncnn::Mat::PIXEL_RGBA2RGB,
-        actualCropSize, actualCropSize,
-        srcStride,  // stride in bytes
-        Config::MODEL_INPUT_SIZE, Config::MODEL_INPUT_SIZE
-    );
-    
-    int unlockResult = AHardwareBuffer_unlock(buffer, nullptr);
-    if (unlockResult != 0) {
-        LOGW("AHardwareBuffer_unlock failed: %d", unlockResult);
-    }
-    
-    // Normalize: scale from [0, 255] to [0, 1]
-    const std::array<float, 3> meanVals = {0.0f, 0.0f, 0.0f};
-    const std::array<float, 3> normVals = {1.0f / 255.0f, 1.0f / 255.0f, 1.0f / 255.0f};
-    inputMat.substract_mean_normalize(meanVals.data(), normVals.data());
-    
-    return true;
-}
-
-bool YoloDetector::runInference(const ncnn::Mat& input, ncnn::Mat& output) {
-    ncnn::Extractor ex = net_.create_extractor();
-
-    // Set input using cached name if available, otherwise fallback to index 0
-    int ret = -1;
-    if (!useInputIndex_ && !inputBlobName_.empty()) {
-        ret = ex.input(inputBlobName_.c_str(), input);
-    }
-
-    if (ret != 0) {
-        useInputIndex_ = true;
-        ret = ex.input(0, input);
-    }
-
-    if (ret != 0) {
-        LOGE("Failed to set input: %d", ret);
+    if (width <= 0 || height <= 0) {
         return false;
     }
 
-    // Get output using cached name if available, otherwise fallback to index 0
-    ret = -1;
-    if (!useOutputIndex_ && !outputBlobName_.empty()) {
-        ret = ex.extract(outputBlobName_.c_str(), output);
-    }
-
-    if (ret != 0) {
-        useOutputIndex_ = true;
-        ret = ex.extract(0, output);
-    }
-
-    if (ret != 0) {
-        LOGE("Failed to extract output: %d", ret);
-        return false;
+    if (stride <= 0) {
+        stride = width;
     }
 
     return true;
 }
 
-void YoloDetector::postprocess(const ncnn::Mat& output, DetectionResult& result, int cropSize) {
-    result.boxes.clear(); // Fix ghosting: Clear previous frame detections
-    float confThreshold = confidenceThreshold_.load(std::memory_order_relaxed);
-    
-    int numBoxes = output.h;
-    int numValues = output.w;
-    bool transposed = false; 
+bool YoloDetector::detect(AHardwareBuffer* buffer,
+                          DetectionResult& result) {
+    return detect(buffer, result, Config::CROP_SIZE);
+}
 
-    if (numBoxes < numValues) {
-        transposed = true;
-        std::swap(numBoxes, numValues);
+bool YoloDetector::detect(AHardwareBuffer* buffer,
+                          DetectionResult& result,
+                          int dynamicCropSize) {
+    result.clear();
+
+    if (!initialized_ || !buffer) {
+        return false;
     }
-    
-    // Cache coordinate mapping scalars (Math Optimization)
-    float captureWidth = static_cast<float>(currentCaptureWidth_ > 0 ? currentCaptureWidth_ : Config::CAPTURE_WIDTH);
-    float captureHeight = static_cast<float>(currentCaptureHeight_ > 0 ? currentCaptureHeight_ : Config::CAPTURE_HEIGHT);
-    float screenW = static_cast<float>(screenWidth_.load(std::memory_order_relaxed));
-    float screenH = static_cast<float>(screenHeight_.load(std::memory_order_relaxed));
-    
-    float modelSize = static_cast<float>(Config::MODEL_INPUT_SIZE);
-    float modelToCrop = static_cast<float>(cropSize) / modelSize;
-    float captureToScreenX = screenW / captureWidth;
-    float captureToScreenY = screenH / captureHeight;
-    
-    // Combined scalars for single-fused multiply (Caching)
-    float scaleX = modelToCrop * captureToScreenX;
-    float scaleY = modelToCrop * captureToScreenY;
-    float offsetX = static_cast<float>(currentCropX_) * captureToScreenX;
-    float offsetY = static_cast<float>(currentCropY_) * captureToScreenY;
-    
-    int numClasses = numValues - 4;
-    int classOffset = 4;
-    float objectness = 1.0f;
-    
-    // Auto-detect YOLO version
-    if (numClasses == Config::NUM_CLASSES + 1) {
-        classOffset = 5;
-        numClasses -= 1; 
+
+    const auto start =
+        std::chrono::steady_clock::now();
+
+    int width = 0;
+    int height = 0;
+    int stride = 0;
+
+    if (!getBufferInfo(buffer, width, height, stride)) {
+        return false;
     }
-    if (numClasses < 1) numClasses = 1;
 
-    // Optimized path: Split loops for Transposed vs Non-Transposed to enable SIMD
-    if (transposed) {
-        const float* row0 = output.row(0);
-        const float* row1 = output.row(1);
-        const float* row2 = output.row(2);
-        const float* row3 = output.row(3);
-        const float* rowObj = (classOffset > 4) ? output.row(4) : nullptr;
-        
-        for (int i = 0; i < numBoxes; ++i) {
-            if (result.boxes.full()) break;
+    currentCaptureWidth_ = width;
+    currentCaptureHeight_ = height;
 
-            float maxClassProb = 0.0f;
-            int bestClassId = 0;
-            
-            if (classOffset > 4) objectness = rowObj[i];
-            
-            // Unrolling class loop slightly helpful, but dynamic count prevents full unroll
-            for (int c = 0; c < numClasses; ++c) {
-                float prob = output.row(classOffset + c)[i];
-                prob *= objectness;
-                if (prob > maxClassProb) {
-                    maxClassProb = prob;
-                    bestClassId = c;
+    const int safeCrop =
+        std::max(64,
+                   std::min(dynamicCropSize,
+                            std::min(width, height)));
+
+    currentCropX_ = std::max(0, (width - safeCrop) / 2);
+    currentCropY_ = std::max(0, (height - safeCrop) / 2);
+
+    void* mapped = nullptr;
+
+    const int lockResult =
+        AHardwareBuffer_lock(
+            buffer,
+            AHARDWAREBUFFER_USAGE_CPU_READ_RARELY,
+            -1,
+            nullptr,
+            &mapped);
+
+    if (lockResult != 0 || mapped == nullptr) {
+        LOGW("AHardwareBuffer_lock failed: %d", lockResult);
+        return false;
+    }
+
+    analyzeFrame(
+        static_cast<const uint8_t*>(mapped),
+        width,
+        height,
+        stride,
+        safeCrop,
+        result);
+
+    AHardwareBuffer_unlock(buffer, nullptr);
+
+    const auto end =
+        std::chrono::steady_clock::now();
+
+    const float elapsed =
+        std::chrono::duration<float, std::milli>(
+            end - start).count();
+
+    result.inferenceTimeMs = elapsed;
+
+    {
+        std::lock_guard<std::mutex> lock(resultMutex_);
+        latestResult_ = result;
+    }
+
+    return true;
+}
+
+void YoloDetector::analyzeFrame(const uint8_t* pixels,
+                                int width,
+                                int height,
+                                int stride,
+                                int cropSize,
+                                DetectionResult& result) {
+    if (!pixels || width <= 0 || height <= 0) {
+        return;
+    }
+
+    const int cropX = currentCropX_;
+    const int cropY = currentCropY_;
+
+    const int cropW =
+        std::min(cropSize, width - cropX);
+
+    const int cropH =
+        std::min(cropSize, height - cropY);
+
+    if (cropW <= 0 || cropH <= 0) {
+        return;
+    }
+
+    /*
+     * Fast first-stage scan.
+     *
+     * We deliberately do not assume the capture buffer is
+     * the same size as the physical Y700 display.
+     *
+     * All candidate coordinates remain in capture space until
+     * mapToScreen() converts them to the actual screen space.
+     */
+    const int step = 4;
+
+    struct Candidate {
+        int x;
+        int y;
+        int w;
+        int h;
+        float score;
+    };
+
+    Candidate candidates[Config::MAX_DETECTIONS];
+    int candidateCount = 0;
+
+    const int minCell = 8;
+    const int maxCell = 160;
+
+    for (int y = cropY; y < cropY + cropH; y += step) {
+        for (int x = cropX; x < cropX + cropW; x += step) {
+
+            const size_t offset =
+                (static_cast<size_t>(y) *
+                 static_cast<size_t>(stride) +
+                 static_cast<size_t>(x)) * 4u;
+
+            const uint8_t r = pixels[offset + 0];
+            const uint8_t g = pixels[offset + 1];
+            const uint8_t b = pixels[offset + 2];
+
+            /*
+             * First-stage visual feature:
+             * strong red / warm-color contrast.
+             *
+             * This is intentionally only a candidate generator,
+             * not a claim that every red pixel is an enemy.
+             */
+            const float redScore =
+                pixelRedScore(r, g, b);
+
+            if (redScore < 0.42f) {
+                continue;
+            }
+
+            int left = x;
+            int right = x;
+            int top = y;
+            int bottom = y;
+
+            const int searchRadius = 12;
+
+            for (int yy = std::max(cropY, y - searchRadius);
+                 yy <= std::min(cropY + cropH - 1,
+                                 y + searchRadius);
+                 yy += 4) {
+
+                for (int xx = std::max(cropX, x - searchRadius);
+                     xx <= std::min(cropX + cropW - 1,
+                                    x + searchRadius);
+                     xx += 4) {
+
+                    const size_t p =
+                        (static_cast<size_t>(yy) *
+                         static_cast<size_t>(stride) +
+                         static_cast<size_t>(xx)) * 4u;
+
+                    const float s =
+                        pixelRedScore(
+                            pixels[p + 0],
+                            pixels[p + 1],
+                            pixels[p + 2]);
+
+                    if (s >= 0.42f) {
+                        left = std::min(left, xx);
+                        right = std::max(right, xx);
+                        top = std::min(top, yy);
+                        bottom = std::max(bottom, yy);
+                    }
                 }
             }
-            
-            if (maxClassProb < confThreshold) continue;
-            if (Config::FILTER_ENEMY_ONLY && bestClassId != Config::ENEMY_CLASS_ID) continue;
 
-            float xCenter = row0[i];
-            float yCenter = row1[i];
-            float width = row2[i];
-            float height = row3[i];
+            const int bw = right - left + 1;
+            const int bh = bottom - top + 1;
 
-            // Normalize if needed (heuristic based on value range)
-            if (xCenter <= 1.5f) {
-                xCenter *= modelSize;
-                yCenter *= modelSize;
-                width *= modelSize;
-                height *= modelSize;
+            if (bw < minCell || bh < minCell ||
+                bw > maxCell || bh > maxCell) {
+                continue;
             }
 
-            // Optimized coordinate transform (Fused Multiply-Add)
-            // box.x = (xCenter - width/2) * scaleX + offsetX
-            float halfW = width * 0.5f;
-            float halfH = height * 0.5f;
-            
-            float boxX = (xCenter - halfW) * scaleX + offsetX;
-            float boxY = (yCenter - halfH) * scaleY + offsetY;
-            float boxW = width * scaleX;
-            float boxH = height * scaleY;
+            const float shape =
+                std::min(
+                    static_cast<float>(bw) /
+                        static_cast<float>(bh),
+                    static_cast<float>(bh) /
+                        static_cast<float>(bw));
 
-            if (boxW <= 0.0f || boxH <= 0.0f) continue;
-            
-            BoundingBox box;
-            box.x = boxX;
-            box.y = boxY;
-            box.width = boxW;
-            box.height = boxH;
-            box.confidence = maxClassProb;
-            box.classId = bestClassId;
-            
-            result.boxes.push(box);
-        }
-    } else {
-        // Non-transposed path (standard NCNN)
-        for (int i = 0; i < numBoxes; ++i) {
-            if (result.boxes.full()) break;
+            const float shapeScore =
+                std::max(0.0f,
+                         std::min(1.0f, shape));
 
-            const float* values = output.row(i);
-            
-            float maxClassProb = 0.0f;
-            int bestClassId = 0;
+            const float score =
+                redScore * 0.75f +
+                shapeScore * 0.25f;
 
-            if (classOffset > 4) objectness = values[4];
-            
-            for (int c = 0; c < numClasses; ++c) {
-                float prob = values[classOffset + c];
-                prob *= objectness;
-                if (prob > maxClassProb) {
-                    maxClassProb = prob;
-                    bestClassId = c;
-                }
-            }
-            
-            if (maxClassProb < confThreshold) continue;
-            if (Config::FILTER_ENEMY_ONLY && bestClassId != Config::ENEMY_CLASS_ID) continue;
-
-            float xCenter = values[0];
-            float yCenter = values[1];
-            float width = values[2];
-            float height = values[3];
-
-            if (xCenter <= 1.5f) {
-                xCenter *= modelSize;
-                yCenter *= modelSize;
-                width *= modelSize;
-                height *= modelSize;
+            if (score <
+                confidenceThreshold_.load(
+                    std::memory_order_relaxed)) {
+                continue;
             }
 
-            float halfW = width * 0.5f;
-            float halfH = height * 0.5f;
-            
-            float boxX = (xCenter - halfW) * scaleX + offsetX;
-            float boxY = (yCenter - halfH) * scaleY + offsetY;
-            float boxW = width * scaleX;
-            float boxH = height * scaleY;
+            if (candidateCount <
+                Config::MAX_DETECTIONS) {
 
-            if (boxW <= 0.0f || boxH <= 0.0f) continue;
-
-            BoundingBox box;
-            box.x = boxX;
-            box.y = boxY;
-            box.width = boxW;
-            box.height = boxH;
-            box.confidence = maxClassProb;
-            box.classId = bestClassId;
-            
-            result.boxes.push(box);
+                candidates[candidateCount++] =
+                    {left, top, bw, bh, score};
+            }
         }
     }
-    
-    if (result.boxes.size() > 1) {
-        applyNMS(result.boxes);
+
+    /*
+     * Convert candidates to the existing BoundingBox format.
+     * The rest of the project can therefore continue using
+     * Tracker / Renderer without knowing that YOLO was removed.
+     */
+    for (int i = 0;
+         i < candidateCount &&
+         result.boxes.size() < Config::MAX_DETECTIONS;
+         ++i) {
+
+        const Candidate& c = candidates[i];
+
+        BoundingBox box =
+            mapToScreen(
+                static_cast<float>(c.x),
+                static_cast<float>(c.y),
+                static_cast<float>(c.w),
+                static_cast<float>(c.h),
+                width,
+                height);
+
+        box.confidence = c.score;
+        box.classId = Config::ENEMY_CLASS_ID;
+
+        if (!validBox(box.x,
+                      box.y,
+                      box.width,
+                      box.height)) {
+            continue;
+        }
+
+        result.boxes.push_back(box);
     }
+
+    applyNMS(result.boxes);
+}
+
+float YoloDetector::scoreCandidate(const uint8_t* pixels,
+                                    int width,
+                                    int height,
+                                    int stride,
+                                    int x,
+                                    int y,
+                                    int w,
+                                    int h) const {
+    if (!pixels ||
+        x < 0 || y < 0 ||
+        x >= width || y >= height ||
+        w <= 0 || h <= 0) {
+        return 0.0f;
+    }
+
+    const int x2 =
+        std::min(width - 1, x + w - 1);
+
+    const int y2 =
+        std::min(height - 1, y + h - 1);
+
+    float total = 0.0f;
+    int count = 0;
+
+    const int step = 4;
+
+    for (int yy = y; yy <= y2; yy += step) {
+        for (int xx = x; xx <= x2; xx += step) {
+            const size_t p =
+                (static_cast<size_t>(yy) *
+                 static_cast<size_t>(stride) +
+                 static_cast<size_t>(xx)) * 4u;
+
+            total += pixelRedScore(
+                pixels[p + 0],
+                pixels[p + 1],
+                pixels[p + 2]);
+
+            ++count;
+        }
+    }
+
+    return count > 0 ? total / count : 0.0f;
+}
+
+BoundingBox YoloDetector::mapToScreen(float x,
+                                      float y,
+                                      float w,
+                                      float h,
+                                      int captureWidth,
+                                      int captureHeight) const {
+    const float screenW =
+        static_cast<float>(
+            screenWidth_.load(std::memory_order_relaxed));
+
+    const float screenH =
+        static_cast<float>(
+            screenHeight_.load(std::memory_order_relaxed));
+
+    const float safeCaptureW =
+        std::max(1.0f,
+                 static_cast<float>(captureWidth));
+
+    const float safeCaptureH =
+        std::max(1.0f,
+                 static_cast<float>(captureHeight));
+
+    const float sx =
+        screenW / safeCaptureW;
+
+    const float sy =
+        screenH / safeCaptureH;
+
+    return BoundingBox(
+        x * sx,
+        y * sy,
+        w * sx,
+        h * sy,
+        0.0f,
+        Config::ENEMY_CLASS_ID);
 }
 
 void YoloDetector::applyNMS(DetectionArray& boxes) {
-    int count = boxes.size();
-    if (count <= 1) return;
-    
-    boxes.sort([](const BoundingBox& a, const BoundingBox& b) {
-        return a.confidence > b.confidence;
-    });
-    
-    std::array<bool, Config::MAX_DETECTIONS> suppressed{};
-    int finalCount = 0;
-    
-    for (int i = 0; i < count; ++i) {
-        if (suppressed[i]) continue;
-        
-        if (i != finalCount) {
-             boxes[finalCount] = boxes[i];
+    const size_t count = boxes.size();
+
+    if (count <= 1) {
+        return;
+    }
+
+    bool suppressed[Config::MAX_DETECTIONS]{};
+
+    DetectionArray output;
+
+    for (size_t i = 0;
+         i < count;
+         ++i) {
+
+        if (suppressed[i]) {
+            continue;
         }
-        finalCount++;
-        
-        for (int j = i + 1; j < count; ++j) {
-            if (!suppressed[j]) {
-                float iou = boxes[i].iou(boxes[j]);
-                if (iou > Config::NMS_IOU_THRESHOLD) {
-                    suppressed[j] = true;
-                }
+
+        size_t best = i;
+
+        for (size_t j = i + 1;
+             j < count;
+             ++j) {
+            if (suppressed[j]) {
+                continue;
+            }
+
+            if (boxes[j].confidence >
+                boxes[best].confidence) {
+                best = j;
+            }
+        }
+
+        if (best != i) {
+            std::swap(boxes[i], boxes[best]);
+        }
+
+        output.push_back(boxes[i]);
+
+        for (size_t j = i + 1;
+             j < count;
+             ++j) {
+
+            if (suppressed[j]) {
+                continue;
+            }
+
+            if (boxes[i].iou(boxes[j]) >
+                Config::NMS_IOU_THRESHOLD) {
+                suppressed[j] = true;
             }
         }
     }
-    
-    // Compact FixedArray by recreating it (stack copy, zero allocation)
-    DetectionArray newBoxes;
-    for (int i = 0; i < finalCount; ++i) {
-        newBoxes.push(boxes[i]);
+
+    boxes.clear();
+
+    for (size_t i = 0;
+         i < output.size() &&
+         boxes.size() < Config::MAX_DETECTIONS;
+         ++i) {
+        boxes.push_back(output[i]);
     }
-    // Assign back (copy data)
-    boxes = newBoxes;
+}
+
+DetectionResult YoloDetector::getResult() const {
+    std::lock_guard<std::mutex> lock(resultMutex_);
+    return latestResult_;
 }
 
 } // namespace ESP
