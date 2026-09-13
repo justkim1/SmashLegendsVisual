@@ -19,6 +19,11 @@ struct UnifiedSettings {
     
     bool aimbotEnabled = false;
     bool espEnabled = true;
+
+    bool smashVisualMode = false;
+    bool smashDistanceLine = true;
+    bool smashRangeCircle = true;
+    float smashRangeRadius = 100.0f;
     
     uint32_t aimbotFps = 60;
     int32_t aimMode = 0;
