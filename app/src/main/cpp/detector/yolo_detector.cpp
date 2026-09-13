@@ -376,7 +376,7 @@ void YoloDetector::analyzeFrame(const uint8_t* pixels,
             continue;
         }
 
-        result.boxes.push_back(box);
+        result.boxes.push(box);
     }
 
     applyNMS(result.boxes);
@@ -502,7 +502,7 @@ void YoloDetector::applyNMS(DetectionArray& boxes) {
             std::swap(boxes[i], boxes[best]);
         }
 
-        output.push_back(boxes[i]);
+        output.push(boxes[i]);
 
         for (size_t j = i + 1;
              j < count;
@@ -525,7 +525,7 @@ void YoloDetector::applyNMS(DetectionArray& boxes) {
          i < output.size() &&
          boxes.size() < Config::MAX_DETECTIONS;
          ++i) {
-        boxes.push_back(output[i]);
+        boxes.push(output[i]);
     }
 }
 

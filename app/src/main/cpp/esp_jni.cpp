@@ -14,6 +14,7 @@
 #include <cstdlib>
 #include <cstdarg>
 #include <cmath>
+#include <ncnn/gpu.h>
 
 // Fix for NDK compatibility issue usually caused by NCNN library mismatch
 // Defines the missing symbol __libcpp_verbose_abort.
