@@ -425,7 +425,7 @@ Java_com_aimbuddy_MainActivity_nativeInit(JNIEnv* env, jobject thiz,
     g_detector = std::make_unique<ESP::YoloDetector>();
     const char* modelParamPath = g_modelParamPath.empty() ? nullptr : g_modelParamPath.c_str();
     const char* modelBinPath = g_modelBinPath.empty() ? nullptr : g_modelBinPath.c_str();
-    if (!g_detector->initialize(mgr, screenWidth, screenHeight, modelParamPath, modelBinPath)) {
+    if (!g_detector->initialize(mgr, screenWidth, screenHeight, nullptr, nullptr)) {
         LOGE("Failed to initialize detector");
         g_detector.reset();
         return JNI_FALSE;
