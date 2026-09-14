@@ -1,0 +1,25 @@
+name: Auto Label Smash Frames
+
+on:
+  workflow_dispatch:
+
+jobs:
+  auto-label:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: pip install ultralytics
+      - name: Auto label
+        run: |
+          python training/src/auto_label.py --in raw_frames --out dataset/train --teacher yolov8x.pt --imgsz 1280 --conf 0.30 --write-negatives
+      - name: Upload labeled dataset
+        uses: actions/upload-artifact@v4
+        with:
+          name: smash-label-preview
+          path: dataset/train
