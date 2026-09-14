@@ -425,19 +425,8 @@ class MainActivity : AppCompatActivity() {
         Log.i(TAG, "Screen: ${screenWidth}x${screenHeight}, density: $screenDensity")
 
         setStatus("Status: Model Loading")
-        modelCatalog = ModelCatalog(this)
 
-        val hasAssetParam = assetExists(ASSET_MODEL_PARAM)
-        val hasAssetBin = assetExists(ASSET_MODEL_BIN)
-        if (!hasAssetParam || !hasAssetBin) {
-            val missing = buildList {
-                if (!hasAssetParam) add(ASSET_MODEL_PARAM)
-                if (!hasAssetBin) add(ASSET_MODEL_BIN)
-            }.joinToString(", ")
-            showAppToast("Missing model in assets: $missing", true)
-        }
 
-        modelCatalog.ensureDefaultAssetModel(hasAssetParam, hasAssetBin)
         migrateLegacySingleImportedModel()
         applyActiveModelSelection()
 
