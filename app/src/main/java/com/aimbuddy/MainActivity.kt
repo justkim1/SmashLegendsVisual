@@ -521,7 +521,7 @@ class MainActivity : AppCompatActivity() {
             return
         }
 
-        requestRootThenMediaProjection()
+        requestMediaProjectionPermission()
     }
 
     private fun requestRootThenMediaProjection() {
