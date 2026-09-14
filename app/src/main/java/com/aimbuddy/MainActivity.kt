@@ -293,7 +293,7 @@ class MainActivity : AppCompatActivity() {
             Log.w(TAG, "MediaProjection stopped by system/user")
             runOnUiThread {
                 if (isRunningState || isStarting.get()) {
-                    showAppToast("Screen capture ended. ESP stopped.", true)
+                    showAppToast("DEBUG: MediaProjection onStop 발생", true)
                     stopESP()
                 }
             }
