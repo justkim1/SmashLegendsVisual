@@ -437,11 +437,7 @@ class MainActivity : AppCompatActivity() {
         // Initialize native components FIRST
         if (!nativeInit(assets, screenWidth, screenHeight)) {
             Log.e(TAG, "Failed to initialize native components")
-            if (!hasAssetParam || !hasAssetBin) {
-                showAppToast("Initialization failed. Import model manually or add assets models.", true)
-            } else {
-                showAppToast("Failed to initialize ESP. Check model files.", true)
-            }
+                showAppToast("Failed to initialize visual detector.", true)
             setStatus("Status: Init Failed")
         } else {
             setStatus("Status: Ready")
