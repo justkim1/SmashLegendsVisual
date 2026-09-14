@@ -33,8 +33,8 @@ public:
         bool airborneCandidate = false;
     };
 
-    explicit KnockbackPredictor(
-        const ConfigData& config = ConfigData());
+    explicit KnockbackPredictor();
+    explicit KnockbackPredictor(const ConfigData& config);
 
     Prediction update(
         const BoundingBox& target,

@@ -19,6 +19,10 @@ float clampValue(
 
 } // namespace
 
+KnockbackPredictor::KnockbackPredictor()
+    : KnockbackPredictor(ConfigData{}) {
+}
+
 KnockbackPredictor::KnockbackPredictor(
     const ConfigData& config)
     : config_(config),

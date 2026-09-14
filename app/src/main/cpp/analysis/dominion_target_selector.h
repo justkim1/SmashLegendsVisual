@@ -48,8 +48,8 @@ public:
         int sourceIndex = -1;
     };
 
-    explicit DominionTargetSelector(
-        const ConfigData& config = ConfigData());
+    explicit DominionTargetSelector();
+    explicit DominionTargetSelector(const ConfigData& config);
 
     Selection select(
         const std::vector<BoundingBox>& boxes,

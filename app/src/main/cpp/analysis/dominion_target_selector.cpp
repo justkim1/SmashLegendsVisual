@@ -27,6 +27,10 @@ float boxArea(const BoundingBox& box) {
 
 } // namespace
 
+DominionTargetSelector::DominionTargetSelector()
+    : DominionTargetSelector(ConfigData{}) {
+}
+
 DominionTargetSelector::DominionTargetSelector(
     const ConfigData& config)
     : config_(config) {
