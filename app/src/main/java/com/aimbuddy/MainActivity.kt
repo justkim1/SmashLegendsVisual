@@ -425,6 +425,7 @@ class MainActivity : AppCompatActivity() {
         Log.i(TAG, "Screen: ${screenWidth}x${screenHeight}, density: $screenDensity")
 
         setStatus("Status: Model Loading")
+        modelCatalog = ModelCatalog(this)
 
 
         migrateLegacySingleImportedModel()
