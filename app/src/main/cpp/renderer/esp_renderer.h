@@ -10,6 +10,8 @@
 #include "../settings.h"
 #include "../utils/logger.h"
 #include "../utils/timer.h"
+#include "../analysis/dominion_target_selector.h"
+#include "../analysis/knockback_predictor.h"
 
 // ImGui includes
 #include "../imgui/imgui.h"
@@ -170,6 +172,21 @@ private:
     BoxSmoother boxSmoother_;
     std::array<BoundingBox, Config::MAX_DETECTIONS> smoothedBoxes_;
     int smoothedCount_{0};
+
+    // Smash Legends visual analysis only.
+    // No touch/key/uinput/Shizuku input is generated here.
+    DominionTargetSelector dominionSelector_;
+    KnockbackPredictor knockbackPredictor_;
+    DominionTargetSelector::Selection dominionSelection_;
+    KnockbackPredictor::Prediction knockbackPrediction_;
+
+    void drawDominionGuide(
+        ImDrawList* drawList,
+        const Vector2& zoneCenter,
+        const Vector2& zoneHalfExtents,
+        float screenWidth,
+        float screenHeight,
+        const DetectionResult& result);
 };
 
 } // namespace ESP

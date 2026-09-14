@@ -151,6 +151,8 @@ set(IMGUI_SOURCES
 set(ESP_SOURCES
     esp_jni.cpp
     detector/yolo_detector.cpp
+    analysis/dominion_target_selector.cpp
+    analysis/knockback_predictor.cpp
     aimbot/aimbot_controller.cpp
     aimbot/target_tracker.cpp
     renderer/overlay_window.cpp

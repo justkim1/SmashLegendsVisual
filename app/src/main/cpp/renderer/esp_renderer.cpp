@@ -1,4 +1,5 @@
 #include <cmath>
+#include <vector>
 #include "esp_renderer.h"
 #include "../utils/vector2.h"
 #include "../utils/imgui_helper.h"
@@ -438,7 +439,260 @@ void ESPRenderer::drawESPBoxes(const DetectionResult& result) {
             }
         }
     }
+
+    // Smash Legends visual analysis guide.
+    // Visual only: target selection + knockback prediction.
+    if (g_settings.smashVisualMode) {
+        const Vector2 zoneCenter(
+            screenW * 0.5f,
+            screenH * 0.5f
+        );
+
+        const Vector2 zoneHalfExtents(
+            espFovRadius,
+            espFovRadius
+        );
+
+        drawDominionGuide(
+            drawList,
+            zoneCenter,
+            zoneHalfExtents,
+            screenW,
+            screenH,
+            result
+        );
+    }
 }
+
+
+void ESPRenderer::drawDominionGuide(
+    ImDrawList* drawList,
+    const Vector2& zoneCenter,
+    const Vector2& zoneHalfExtents,
+    float screenWidth,
+    float screenHeight,
+    const DetectionResult& result)
+{
+    if (!drawList || result.boxes.empty()) {
+        return;
+    }
+
+    // Convert detector output to the Smash-specific selector input.
+    std::vector<BoundingBox> boxes;
+    boxes.reserve(result.boxes.size());
+
+    for (const BoundingBox& box : result.boxes) {
+        if (box.confidence < g_settings.confidenceThreshold) {
+            continue;
+        }
+
+        if (box.width <= 1.0f || box.height <= 1.0f) {
+            continue;
+        }
+
+        boxes.push_back(box);
+    }
+
+    if (boxes.empty()) {
+        return;
+    }
+
+    // Select the most relevant opponent around the central Dominion zone.
+    dominionSelection_ = dominionSelector_.select(
+        boxes,
+        zoneCenter,
+        zoneHalfExtents,
+        screenWidth,
+        screenHeight
+    );
+
+    // Draw candidate information.
+    const auto& candidates = dominionSelector_.getCandidates();
+
+    for (const auto& candidate : candidates) {
+        const BoundingBox& box = candidate.box;
+
+        ImVec2 min(
+            box.x,
+            box.y
+        );
+
+        ImVec2 max(
+            box.x + box.width,
+            box.y + box.height
+        );
+
+        ImU32 color;
+
+        if (candidate.likelyDowned) {
+            color = IM_COL32(180, 80, 255, 210);
+        } else if (candidate.insideZone) {
+            color = IM_COL32(255, 170, 40, 230);
+        } else if (candidate.nearZone) {
+            color = IM_COL32(255, 220, 80, 180);
+        } else {
+            color = IM_COL32(130, 130, 130, 130);
+        }
+
+        drawList->AddRect(
+            min,
+            max,
+            color,
+            0.0f,
+            0,
+            1.5f
+        );
+    }
+
+    if (!dominionSelection_.valid) {
+        knockbackPredictor_.reset();
+        return;
+    }
+
+    const BoundingBox& target = dominionSelection_.target;
+
+    const ImVec2 targetMin(
+        target.x - 2.0f,
+        target.y - 2.0f
+    );
+
+    const ImVec2 targetMax(
+        target.x + target.width + 2.0f,
+        target.y + target.height + 2.0f
+    );
+
+    // Selected target.
+    drawList->AddRect(
+        targetMin,
+        targetMax,
+        IM_COL32(255, 70, 70, 255),
+        0.0f,
+        0,
+        4.0f
+    );
+
+    const Vector2 targetCenter = target.center();
+
+    drawList->AddCircleFilled(
+        ImVec2(targetCenter.x, targetCenter.y),
+        6.0f,
+        IM_COL32(255, 60, 60, 255),
+        16
+    );
+
+    drawList->AddText(
+        ImVec2(target.x, target.y - 18.0f),
+        IM_COL32(255, 80, 80, 255),
+        "TARGET"
+    );
+
+    // The screen center is used as the local-player reference until
+    // a dedicated SELF class is available from the detector.
+    const Vector2 selfPosition(
+        screenWidth * 0.5f,
+        screenHeight * 0.5f
+    );
+
+    const double now = ImGui::GetTime();
+
+    knockbackPrediction_ = knockbackPredictor_.update(
+        target,
+        zoneCenter,
+        zoneHalfExtents,
+        selfPosition,
+        now
+    );
+
+    if (!knockbackPrediction_.valid) {
+        return;
+    }
+
+    const Vector2& predicted = knockbackPrediction_.predictedPosition;
+
+    // Current -> predicted trajectory.
+    drawList->AddLine(
+        ImVec2(targetCenter.x, targetCenter.y),
+        ImVec2(predicted.x, predicted.y),
+        IM_COL32(255, 240, 70, 230),
+        2.5f
+    );
+
+    drawList->AddCircle(
+        ImVec2(predicted.x, predicted.y),
+        11.0f,
+        IM_COL32(255, 240, 70, 255),
+        24,
+        3.0f
+    );
+
+    drawList->AddCircleFilled(
+        ImVec2(predicted.x, predicted.y),
+        4.0f,
+        IM_COL32(255, 240, 70, 255),
+        16
+    );
+
+    drawList->AddText(
+        ImVec2(predicted.x + 12.0f, predicted.y - 8.0f),
+        IM_COL32(255, 240, 70, 255),
+        "+ PREDICTED"
+    );
+
+    // Visual push-direction guide.
+    const Vector2& pushEnd = knockbackPrediction_.pushEnd;
+    const Vector2& pushVector = knockbackPrediction_.pushVector;
+
+    drawList->AddLine(
+        ImVec2(predicted.x, predicted.y),
+        ImVec2(pushEnd.x, pushEnd.y),
+        IM_COL32(80, 220, 255, 255),
+        4.0f
+    );
+
+    // Arrow head.
+    const float pushLength =
+        std::sqrt(pushVector.x * pushVector.x +
+                  pushVector.y * pushVector.y);
+
+    if (pushLength > 0.001f) {
+        const float nx = pushVector.x / pushLength;
+        const float ny = pushVector.y / pushLength;
+
+        const float px = -ny;
+        const float py = nx;
+
+        const float arrowSize = 14.0f;
+
+        ImVec2 tip(
+            pushEnd.x,
+            pushEnd.y
+        );
+
+        ImVec2 left(
+            pushEnd.x - nx * arrowSize + px * arrowSize * 0.55f,
+            pushEnd.y - ny * arrowSize + py * arrowSize * 0.55f
+        );
+
+        ImVec2 right(
+            pushEnd.x - nx * arrowSize - px * arrowSize * 0.55f,
+            pushEnd.y - ny * arrowSize - py * arrowSize * 0.55f
+        );
+
+        drawList->AddTriangleFilled(
+            tip,
+            left,
+            right,
+            IM_COL32(80, 220, 255, 255)
+        );
+    }
+
+    drawList->AddText(
+        ImVec2(pushEnd.x + 8.0f, pushEnd.y + 4.0f),
+        IM_COL32(80, 220, 255, 255),
+        "PUSH ->"
+    );
+}
+
 
 void ESPRenderer::drawMenu() {
     ImGuiIO& io = ImGui::GetIO();
